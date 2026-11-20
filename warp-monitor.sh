@@ -33,7 +33,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ---------- пути ----------
 CONF="${WARP_MONITOR_CONF:-/etc/warp-monitor.conf}"
@@ -141,26 +141,32 @@ egress_ip() {
          https://api.ipify.org 2>/dev/null || echo "недоступен"
 }
 
+# строка в блок отчёта (без под-shell — счётчики EG_OK/EG_FAIL должны жить в текущем shell)
+egress_line() {
+    EGRESS_BLOCK="${EGRESS_BLOCK}$1
+"
+}
+
 run_egress_tests() {
-    # $1 = "" (через WARP) или "direct"; наполняет EG_OK / EG_FAIL и печатает строки
+    # $1 = "" (через WARP) или "direct"; наполняет EGRESS_BLOCK и EG_OK / EG_FAIL
     local mode="${1:-}" label url code t name
     if [ "$mode" = "direct" ]; then label="напрямую"; else label="через WARP ($WARP_SOCKS)"; fi
-    echo "egress-тесты $label:"
+    egress_line "egress-тесты $label:"
     for url in $SITES; do
         name=$(printf '%s' "$url" | sed -e 's|^https\?://||' -e 's|/$||')
         read -r code t < <(probe_site "$url" "$mode")
-        if [ "$code" = "000" ] || [ "$code" = "0" ]; then
-            printf '  %-28s FAIL (нет ответа за %ss)\n' "$name" "$CURL_TIMEOUT"
+        if [ "$code" = "000" ] || [ "$code" = "0" ] || [ -z "$code" ]; then
+            egress_line "$(printf '  %-28s FAIL (нет ответа за %ss)' "$name" "$CURL_TIMEOUT")"
             if [ "$mode" != "direct" ]; then EG_FAIL=$((EG_FAIL+1)); fi
         elif [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
-            printf '  %-28s %s  %ss  OK\n' "$name" "$code" "$t"
+            egress_line "$(printf '  %-28s %s  %ss  OK' "$name" "$code" "$t")"
             if [ "$mode" != "direct" ]; then EG_OK=$((EG_OK+1)); fi
         elif [ "$code" -ge 400 ] && [ "$code" -lt 500 ]; then
             # 4xx = сайт ответил (туннель работает), но контент/защита
-            printf '  %-28s %s  %ss  OK (HTTP %s от сервера)\n' "$name" "$code" "$t" "$code"
+            egress_line "$(printf '  %-28s %s  %ss  OK (HTTP %s от сервера)' "$name" "$code" "$t" "$code")"
             if [ "$mode" != "direct" ]; then EG_OK=$((EG_OK+1)); fi
         else
-            printf '  %-28s %s  %ss  FAIL\n' "$name" "$code" "$t"
+            egress_line "$(printf '  %-28s %s  %ss  FAIL' "$name" "$code" "$t")"
             if [ "$mode" != "direct" ]; then EG_FAIL=$((EG_FAIL+1)); fi
         fi
     done
@@ -222,8 +228,8 @@ cmd_check() {
             WARP_ST="warp-cli НЕ УСТАНОВЛЕН"
             log "критично: warp-cli не установлен"
             WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
-            EG_OK=0; EG_FAIL=0
-            EGRESS_BLOCK=$(run_egress_tests direct 2>&1)
+            EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+            run_egress_tests direct
             SUMMARY="CRIT: warp-cli не установлен"
             write_report
             out "$SUMMARY"
@@ -234,8 +240,8 @@ cmd_check() {
             WARP_ST="не зарегистрирован (Registration Missing)"
             log "критично: WARP не зарегистрирован"
             WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
-            EG_OK=0; EG_FAIL=0
-            EGRESS_BLOCK=$(run_egress_tests direct 2>&1)
+            EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+            run_egress_tests direct
             SUMMARY="CRIT: WARP не зарегистрирован (warp-cli registration new)"
             write_report
             out "$SUMMARY"
@@ -253,8 +259,8 @@ cmd_check() {
         WARP_ST="ВЫКЛЮЧЕН (после $(echo "$CONNECT_RETRIES") попыток)"
         log "критично: WARP не поднялся"
         WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
-        EG_OK=0; EG_FAIL=0
-        EGRESS_BLOCK=$(run_egress_tests direct 2>&1)
+        EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+        run_egress_tests direct
         SUMMARY="CRIT: WARP выключен, трафик идёт напрямую"
         write_report
         out "$SUMMARY"
@@ -266,11 +272,10 @@ cmd_check() {
     log "warp: Connected, запускаю egress-тесты"
     WARP_IP=$(egress_ip)
     DIRECT_IP=$(egress_ip direct)
-    EG_OK=0; EG_FAIL=0
-    EGRESS_BLOCK=$(run_egress_tests 2>&1)
+    EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+    run_egress_tests
     if [ "$RUN_DIRECT_TEST" = "1" ]; then
-        EGRESS_BLOCK="$EGRESS_BLOCK
-$(run_egress_tests direct 2>&1)"
+        run_egress_tests direct
     fi
 
     if [ "$EG_FAIL" -ge "$FAIL_THRESHOLD" ]; then
@@ -298,8 +303,9 @@ IP выхода через WARP: $WARP_IP"
 cmd_egress() {
     prepare_dirs
     load_conf
-    EG_OK=0; EG_FAIL=0
+    EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
     run_egress_tests
+    printf '%s' "$EGRESS_BLOCK"
     out "IP выхода через WARP: $(egress_ip)"
 }
 
