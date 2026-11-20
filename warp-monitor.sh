@@ -33,7 +33,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 
 # ---------- пути ----------
 CONF="${WARP_MONITOR_CONF:-/etc/warp-monitor.conf}"
@@ -103,8 +103,20 @@ warp_status() {
     esac
 }
 
+warp_svc_ensure() {
+    # если упал сам демон warp-svc — поднимаем сервис, иначе connect не сработает
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl cat warp-svc.service >/dev/null 2>&1 && ! systemctl is-active --quiet warp-svc; then
+        log "warp-svc не активен — запускаю сервис"
+        systemctl start warp-svc 2>/dev/null || true
+        sleep 3
+    fi
+    return 0
+}
+
 warp_connect() {
     local st i
+    warp_svc_ensure
     for i in $(seq 1 "$CONNECT_RETRIES"); do
         log "warp: попытка подключения $i/$CONNECT_RETRIES ..."
         $WARP_CLI connect >/dev/null 2>&1 || true
