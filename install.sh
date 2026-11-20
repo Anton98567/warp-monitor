@@ -39,7 +39,8 @@ command -v curl >/dev/null 2>&1 || { echo "Нужен curl." >&2; exit 2; }
 
 echo "[1/4] Скачиваю warp-monitor.sh ..."
 mkdir -p "$INSTALL_DIR"
-curl -fsSL "$REPO_RAW/warp-monitor.sh" -o "$INSTALL_DIR/warp-monitor.sh"
+# cache-buster: raw.githubusercontent.com кэширует по URL — без параметра можно получить старую версию
+curl -fsSL "$REPO_RAW/warp-monitor.sh?ts=$(date +%s)" -o "$INSTALL_DIR/warp-monitor.sh"
 chmod 755 "$INSTALL_DIR/warp-monitor.sh"
 
 echo "[2/4] Конфиг $CONF ..."

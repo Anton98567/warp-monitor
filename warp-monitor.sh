@@ -33,7 +33,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 
 # ---------- пути ----------
 CONF="${WARP_MONITOR_CONF:-/etc/warp-monitor.conf}"
@@ -161,9 +161,9 @@ run_egress_tests() {
         elif [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
             egress_line "$(printf '  %-28s %s  %ss  OK' "$name" "$code" "$t")"
             if [ "$mode" != "direct" ]; then EG_OK=$((EG_OK+1)); fi
-        elif [ "$code" -ge 400 ] && [ "$code" -lt 500 ]; then
-            # 4xx = сайт ответил (туннель работает), но контент/защита
-            egress_line "$(printf '  %-28s %s  %ss  OK (HTTP %s от сервера)' "$name" "$code" "$t" "$code")"
+        elif [ "$code" -ge 400 ] && [ "$code" -lt 600 ]; then
+            # 4xx/5xx = сервер ответил, туннель работает (антибот/контент — не проблема WARP)
+            egress_line "$(printf '  %-28s %s  %ss  OK (туннель работает, HTTP %s от сервера)' "$name" "$code" "$t" "$code")"
             if [ "$mode" != "direct" ]; then EG_OK=$((EG_OK+1)); fi
         else
             egress_line "$(printf '  %-28s %s  %ss  FAIL' "$name" "$code" "$t")"
