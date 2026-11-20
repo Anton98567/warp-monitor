@@ -1,21 +1,41 @@
 # warp-monitor
 
-Универсальный скрипт мониторинга **Cloudflare WARP** на Linux-серверах + egress-тесты
-на основные сайты. Без личных данных, работает на любом сервере с установленным
-`warp-cli` (Ubuntu/Debian/CentOS/Alma/Rocky).
+Универсальный скрипт мониторинга **Cloudflare WARP** на Linux-серверах:
+**100% проверка работоспособности + автоматический перезапуск при сбое**
++ почасовые egress-тесты на основные сайты. Без личных данных, работает на любом
+сервере с установленным `warp-cli` (Ubuntu/Debian/CentOS/Alma/Rocky).
 
-## Что делает
+## 100% проверка «WARP работает»
 
-* проверяет статус `warp-cli` каждый час (cron) и **сам переподключает** WARP при обрыве;
-* тестирует egress через WARP SOCKS-прокси (WarpProxy) на 8 сайтов:
-  Google, Яндекс, Рамблер + Cloudflare, GitHub, YouTube, Wikipedia, Amazon (список настраивается);
-  любой HTTP-ответ сервера (в т.ч. 4xx/5xx антибота) означает, что туннель работает —
-  FAIL только при полном отсутствии ответа (обрыв/таймаут);
-* дополнительно (опционально) проверяет те же сайты напрямую — видно, проблема в WARP или в сети;
-* показывает IP выхода через WARP и напрямую;
-* пишет лог (`/var/log/warp-monitor/`) и текстовый отчёт (`/var/lib/warp-monitor/last-report.txt`);
-* опционально шлёт алерты в Telegram (только при сбое и восстановлении — не спамит);
-* авто-ротация лога встроена (5 × 5 МБ) + logrotate.
+Скрипт не доверяет одному только статусу `warp-cli`. Все 5 пунктов обязательны:
+
+1. сервис `warp-svc` активен (systemd);
+2. `warp-cli status` = Connected;
+3. SOCKS-прокси (WarpProxy) реально отвечает;
+4. через прокси `https://www.cloudflare.com/cdn-cgi/trace` возвращает **`warp=on`**
+   — железное доказательство, что трафик выходит через WARP (напрямую тот же URL
+   даёт `warp=off`);
+5. IP выхода через WARP отличается от прямого IP сервера.
+
+## Автоперезапуск при сбое
+
+Если провалился хотя бы один пункт — скрипт автоматически делает **перезапуск**:
+
+```
+warp-cli disconnect → systemctl restart warp-svc → warp-cli mode proxy →
+warp-cli connect → повторная полная проверка (до 3 кругов)
+```
+
+После успешного перезапуска egress-тесты подтверждают, что туннель реально работает.
+Если поднять не удалось — критический статус (exit 2) и детальный отчёт.
+
+## Egress-тесты
+
+Каждый час (cron) тестируется подключение через WARP к 8 сайтам:
+**Google, Яндекс, Рамблер** + Cloudflare, GitHub, YouTube, Wikipedia, Amazon
+(список настраивается). Опционально те же сайты тестируются напрямую — для сравнения.
+Любой HTTP-ответ сервера (в т.ч. 4xx/5xx антибота) означает, что туннель работает;
+FAIL — только при полном отсутствии ответа.
 
 ## Установка одной командой
 
@@ -24,8 +44,8 @@ curl -fsSL https://raw.githubusercontent.com/Anton98567/warp-monitor/main/instal
 ```
 
 Установщик скачает скрипт в `/usr/local/bin/warp-monitor.sh`, создаст конфиг
-`/etc/warp-monitor.conf`, поставит почасовой cron (проверка в HH:17) и выполнит
-пробный запуск.
+`/etc/warp-monitor.conf`, поставит почасовой cron (проверка в HH:17) и logrotate
+и выполнит пробную проверку.
 
 Опции:
 
@@ -38,24 +58,23 @@ curl -fsSL https://raw.githubusercontent.com/Anton98567/warp-monitor/main/instal
 
 * Linux с `curl` и `bash`;
 * клиент Cloudflare WARP (`warp-cli`) — сам НЕ устанавливается скриптом;
-* режим WarpProxy: `warp-monitor.sh setup-proxy` (включит `warp-cli mode proxy` на порту 40000).
+* режим WarpProxy: `warp-monitor.sh setup-proxy` (включит `warp-cli mode proxy`).
 
 ## Команды
 
 | Команда | Действие |
 |---|---|
-| `warp-monitor.sh` / `check` | полный цикл: статус WARP + авто-лечение + egress-тесты |
-| `warp-monitor.sh egress` | только egress-тесты (без переподключения) |
+| `warp-monitor.sh` / `check` | 100% верификация + перезапуск при сбое + egress-тесты |
+| `warp-monitor.sh egress` | только egress-тесты (без перезапуска) |
 | `warp-monitor.sh status` | статус WARP + последний отчёт |
 | `warp-monitor.sh report` | распечатать полный отчёт |
 | `warp-monitor.sh setup-proxy` | включить WarpProxy (порт из конфига) |
 | `warp-monitor.sh install` | поставить cron + logrotate |
 | `warp-monitor.sh uninstall` | удалить cron + logrotate |
-| `warp-monitor.sh test-alert` | тест уведомления в Telegram |
 | `warp-monitor.sh --quiet` | без вывода в stdout (для cron) |
 
-Коды выхода: `0` — всё OK, `1` — деградация (часть сайтов недоступна),
-`2` — критично (WARP выключен / не зарегистрирован / не установлен).
+Коды выхода: `0` — WARP работает, `1` — WARP работает, но часть сайтов недоступна,
+`2` — WARP НЕ работает (после всех перезапусков) / не установлен / не зарегистрирован.
 
 ## Конфигурация
 
@@ -64,40 +83,13 @@ curl -fsSL https://raw.githubusercontent.com/Anton98567/warp-monitor/main/instal
 ```bash
 WARP_CLI="warp-cli --accept-tos"     # команда warp-cli
 WARP_SOCKS="127.0.0.1:40000"         # адрес WarpProxy SOCKS5
+WARP_PROXY_PORT=40000                # порт WarpProxy (для перезапуска/настройки)
 CURL_TIMEOUT=15                      # таймаут HTTP-запроса, сек
-CONNECT_RETRIES=3                    # попыток переподключения WARP
-CONNECT_WAIT=6                       # пауза между попытками, сек
-FAIL_THRESHOLD=2                     # упавших сайтов >= N => деградация
+HEAL_ROUNDS=3                        # кругов перезапуска при сбое
+HEAL_WAIT=8                          # ожидание после перезапуска, сек
 RUN_DIRECT_TEST=1                    # 1 = тестировать сайты и напрямую
-ALERT_ON_RECOVER=1                   # 1 = уведомлять о восстановлении
 SITES="https://www.google.com https://ya.ru https://www.rambler.ru ..."
-TELEGRAM_TOKEN=""                    # токен Telegram-бота (опц.)
-TELEGRAM_CHAT_ID=""                  # chat_id (опц.)
 ```
-
-## Telegram-алерты (опционально)
-
-Заполните в `/etc/warp-monitor.conf`:
-
-```bash
-TELEGRAM_TOKEN="<токен бота>"
-TELEGRAM_CHAT_ID="<chat_id>"
-```
-
-Затем `warp-monitor.sh test-alert`. Уведомления уходят только при смене состояния
-(сбой / восстановление), ежечасные успешные проверки молчат.
-
-## Авто-лечение
-
-Если WARP отвалился, скрипт при почасовой проверке сам чинит его по цепочке:
-
-1. упал демон `warp-svc` → `systemctl start warp-svc`;
-2. статус `Disconnected`/`unknown` → `warp-cli connect` (до 3 попыток с паузой);
-3. после переподключения — egress-тесты подтверждают, что туннель реально работает.
-
-Если поднять не удалось — критический алерт в Telegram и отчёт (трафик идёт
-напрямую, IP виден). Максимальное время до авто-лечения — до 1 часа
-(до следующего запуска cron); можно уменьшить интервал в `/etc/cron.d/warp-monitor`.
 
 ## Файлы
 
@@ -106,9 +98,8 @@ TELEGRAM_CHAT_ID="<chat_id>"
 | `/usr/local/bin/warp-monitor.sh` | сам скрипт |
 | `/etc/warp-monitor.conf` | настройки (600) |
 | `/etc/cron.d/warp-monitor` | почасовой cron (HH:17) |
-| `/var/log/warp-monitor/warp-monitor.log` | лог |
+| `/var/log/warp-monitor/warp-monitor.log` | лог (авто-ротация 6 × 5 МБ + logrotate) |
 | `/var/lib/warp-monitor/last-report.txt` | последний отчёт |
-| `/var/lib/warp-monitor/last-state` | последнее состояние (для алертов) |
 
 ## Лицензия
 

@@ -69,15 +69,12 @@ if [ ! -f "$CONF" ]; then
 # 1 = дополнительно тестировать сайты напрямую (мимо WARP)
 #RUN_DIRECT_TEST=1
 
-# 1 = слать уведомление и о восстановлении
-#ALERT_ON_RECOVER=1
+# Кругов перезапуска WARP при сбое и ожидание после перезапуска, сек
+#HEAL_ROUNDS=3
+#HEAL_WAIT=8
 
-# Сайты для egress-тестов (через запятую не нужно — через пробел)
+# Сайты для egress-тестов (через пробел)
 #SITES="https://www.google.com https://ya.ru https://www.rambler.ru https://www.cloudflare.com https://github.com https://www.youtube.com https://www.wikipedia.org https://www.amazon.com"
-
-# Telegram-алерты (опционально): оставьте пустыми, чтобы отключить
-#TELEGRAM_TOKEN=""
-#TELEGRAM_CHAT_ID=""
 EOF
     chmod 600 "$CONF"
     echo "      создан: $CONF"
@@ -102,10 +99,9 @@ if [ "$DO_CHECK" -eq 1 ]; then
 else
     echo "      пропущено (--no-check)"
 fi
-
 echo
 echo "Готово. Команды:"
-echo "  warp-monitor.sh check    — проверка сейчас"
+echo "  warp-monitor.sh check    — полная проверка WARP + перезапуск при сбое"
 echo "  warp-monitor.sh status   — статус и последний отчёт"
 echo "  warp-monitor.sh report   — полный отчёт"
 echo "  warp-monitor.sh help     — все команды"

@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
 #
-# warp-monitor.sh — универсальный мониторинг Cloudflare WARP + egress-тесты.
+# warp-monitor.sh — универсальный мониторинг Cloudflare WARP: 100% проверка
+# работоспособности + автоматический перезапуск при сбое + egress-тесты.
 #
-# Что делает:
-#   * проверяет статус warp-cli и сам чинит соединение (connect) при обрыве;
-#   * тестирует egress через WARP SOCKS-прокси на список сайтов
-#     (Google, Яндекс, Рамблер + ещё 5 — настраивается в конфиге);
-#   * показывает IP выхода напрямую и через WARP;
-#   * пишет лог и текстовый отчёт, опционально шлёт алерты в Telegram;
-#   * "install" ставит почасовую проверку в cron.
+# Проверка «WARP работает» проходит ПОЛНОСТЬЮ (все пункты обязательны):
+#   1. сервис warp-svc активен (systemd);
+#   2. warp-cli reports статус Connected;
+#   3. SOCKS-прокси (WarpProxy) реально отвечает;
+#   4. через прокси https://www.cloudflare.com/cdn-cgi/trace возвращает
+#      "warp=on" — железное доказательство, что трафик выходит через WARP
+#      (напрямую тот же URL даёт "warp=off");
+#   5. IP выхода через WARP отличается от прямого IP сервера.
+# Если хотя бы один пункт провален — скрипт ДЕЛАЕТ ПЕРЕЗАПУСК:
+#   warp-cli disconnect → systemctl restart warp-svc → режим proxy →
+#   warp-cli connect → повторная полная проверка (до 3 кругов).
 #
 # Использование:
-#   warp-monitor.sh [check|egress|status|report|setup-proxy|install|uninstall|test-alert|help]
+#   warp-monitor.sh [check|egress|status|report|setup-proxy|install|uninstall|help]
 #
-#   check        — полный цикл: статус WARP + авто-лечение + egress-тесты (по умолчанию)
-#   egress       — только egress-тесты (без переподключения WARP)
+#   check        — полный цикл: верификация + перезапуск при сбое + egress-тесты
+#                  (по умолчанию; именно это запускает почасовой cron)
+#   egress       — только egress-тесты на сайты (Google, Яндекс, Рамблер +5)
 #   status       — статус WARP + последний отчёт
 #   report       — распечатать последний отчёт
 #   setup-proxy  — включить режим WarpProxy (warp-cli mode proxy + порт из конфига)
-#   install      — установить почасовой cron + logrotate
+#   install      — установить почасовой cron (HH:17) + logrotate
 #   uninstall    — удалить cron и logrotate
-#   test-alert   — отправить тестовое уведомление в Telegram
 #   --quiet      — без вывода в stdout (для cron; лог и отчёт пишутся всё равно)
 #
-# Конфиг: /etc/warp-monitor.conf (переменные KEY=VALUE, владелец root, 600).
-# Коды выхода: 0 = всё OK, 1 = деградация (часть сайтов недоступна), 2 = критично
-#              (WARP выключен/не зарегистрирован/не установлен).
+# Конфиг: /etc/warp-monitor.conf (KEY=VALUE, владелец root, 600).
+# Коды выхода: 0 = WARP работает, 2 = WARP не работает (после всех перезапусков).
 #
 # Поддерживает Ubuntu/Debian/CentOS/Alma/Rocky с установленным warp-cli
-# (Cloudflare WARP client). Сам warp-cli НЕ устанавливает.
+# (клиент Cloudflare WARP). Сам warp-cli НЕ устанавливает.
 
 set -u
 set -o pipefail
 
-VERSION="1.0.3"
+VERSION="2.0.0"
 
 # ---------- пути ----------
 CONF="${WARP_MONITOR_CONF:-/etc/warp-monitor.conf}"
@@ -44,17 +48,14 @@ REPORT_FILE="$STATE_DIR/last-report.txt"
 STATE_FILE="$STATE_DIR/last-state"
 
 # ---------- настройки по умолчанию (перекрываются из /etc/warp-monitor.conf) ----------
-WARP_CLI="${WARP_CLI:-warp-cli --accept-tos}"   # команда warp-cli (флаг --accept-tos нужен на свежих установках)
+WARP_CLI="${WARP_CLI:-warp-cli --accept-tos}"   # команда warp-cli
 WARP_SOCKS="${WARP_SOCKS:-127.0.0.1:40000}"     # адрес WarpProxy SOCKS5
+WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"     # порт WarpProxy (для setup-proxy/перезапуска)
 CURL_TIMEOUT="${CURL_TIMEOUT:-15}"              # таймаут одного HTTP-запроса, сек
 IP_TIMEOUT="${IP_TIMEOUT:-10}"                  # таймаут определения IP выхода, сек
-CONNECT_RETRIES="${CONNECT_RETRIES:-3}"         # попыток переподключения WARP
-CONNECT_WAIT="${CONNECT_WAIT:-6}"               # ожидание между попытками, сек
-FAIL_THRESHOLD="${FAIL_THRESHOLD:-2}"           # упавших сайтов >= N => деградация
-RUN_DIRECT_TEST="${RUN_DIRECT_TEST:-1}"         # 1 = дополнительно тестить сайты напрямую (мимо WARP)
-ALERT_ON_RECOVER="${ALERT_ON_RECOVER:-1}"       # 1 = слать уведомление и о восстановлении
-TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"            # токен бота (опционально)
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"        # chat_id (опционально)
+HEAL_ROUNDS="${HEAL_ROUNDS:-3}"                 # кругов перезапуска при сбое
+HEAL_WAIT="${HEAL_WAIT:-8}"                     # ожидание после перезапуска, сек
+RUN_DIRECT_TEST="${RUN_DIRECT_TEST:-1}"         # 1 = egress-тесты также напрямую (для сравнения)
 
 # Сайты для egress-тестов: Google, Яндекс, Рамблер + 5 дополнительных.
 SITES="${SITES:-https://www.google.com https://ya.ru https://www.rambler.ru https://www.cloudflare.com https://github.com https://www.youtube.com https://www.wikipedia.org https://www.amazon.com}"
@@ -76,7 +77,7 @@ load_conf() {
 
 prepare_dirs() {
     mkdir -p "$LOG_DIR" "$STATE_DIR" 2>/dev/null || true
-    # встроенная ротация лога (5 файлов по 5 МБ) — не требует logrotate
+    # встроенная ротация лога (6 файлов по 5 МБ) — не требует logrotate
     if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 5242880 ]; then
         local i
         for i in 5 4 3 2 1; do
@@ -89,51 +90,120 @@ prepare_dirs() {
 # ---------- warp-cli ----------
 warp_cli_ok() { command -v ${WARP_CLI%% *} >/dev/null 2>&1; }
 
+warp_status_raw() {
+    $WARP_CLI status 2>&1 || true
+}
+
 warp_status() {
     # echo: connected | disconnected | unregistered | missing | unknown
     if ! warp_cli_ok; then echo "missing"; return; fi
     local out
-    out=$($WARP_CLI status 2>&1) || true
+    out=$(warp_status_raw)
     case "$out" in
         *Disconnected*)                echo "disconnected" ;;   # проверять до Connected!
         *Connected*)                   echo "connected" ;;
         *"Registration Missing"*|*Unregistered*|*"not registered"*|*"Terms of Service"*) echo "unregistered" ;;
-        *"No such"*|*Error*|*error*)   echo "unknown" ;;
         *)                             echo "unknown" ;;
     esac
 }
 
-warp_svc_ensure() {
-    # если упал сам демон warp-svc — поднимаем сервис, иначе connect не сработает
-    command -v systemctl >/dev/null 2>&1 || return 0
-    if systemctl cat warp-svc.service >/dev/null 2>&1 && ! systemctl is-active --quiet warp-svc; then
-        log "warp-svc не активен — запускаю сервис"
-        systemctl start warp-svc 2>/dev/null || true
-        sleep 3
+# ---------- верификация «WARP работает» (100%) ----------
+# Заполняет массив VERIFY[] парами "проверка|OK/FAIL|детали" и
+# возвращает 0 только если ВСЕ проверки прошли.
+verify_warp() {
+    VERIFY=()
+    local ok=1 st trace warp_flag ip_warp ip_direct
+
+    # 1. сервис warp-svc
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat warp-svc.service >/dev/null 2>&1; then
+        if systemctl is-active --quiet warp-svc; then
+            VERIFY+=("warp-svc активен|OK|")
+        else
+            VERIFY+=("warp-svc активен|FAIL|сервис остановлен")
+            ok=0
+        fi
+    else
+        VERIFY+=("warp-svc активен|OK|systemd не найден, пропущено")
     fi
-    return 0
+
+    # 2. статус warp-cli
+    st=$(warp_status)
+    if [ "$st" = "connected" ]; then
+        VERIFY+=("warp-cli статус Connected|OK|")
+    else
+        VERIFY+=("warp-cli статус Connected|FAIL|статус: $st")
+        ok=0
+    fi
+
+    # 3. SOCKS-прокси отвечает + 4. warp=on в cdn-cgi/trace через прокси
+    trace=$(curl -s --max-time "$CURL_TIMEOUT" --socks5-hostname "$WARP_SOCKS" \
+                 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if [ -z "$trace" ]; then
+        VERIFY+=("SOCKS-прокси отвечает|FAIL|$WARP_SOCKS не отвечает")
+        VERIFY+=("trace через прокси: warp=on|FAIL|нет ответа")
+        ok=0
+    else
+        VERIFY+=("SOCKS-прокси отвечает|OK|$WARP_SOCKS")
+        warp_flag=$(printf '%s\n' "$trace" | sed -n 's/^warp=//p' | head -1)
+        if [ "$warp_flag" = "on" ]; then
+            VERIFY+=("trace через прокси: warp=on|OK|трафик выходит через WARP")
+        else
+            VERIFY+=("trace через прокси: warp=on|FAIL|warp=${warp_flag:-?} — трафик НЕ через WARP")
+            ok=0
+        fi
+    fi
+
+    # 5. IP выхода через WARP отличается от прямого IP
+    ip_warp=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
+    ip_direct=$(curl -s --max-time "$IP_TIMEOUT" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+                | sed -n 's/^ip=//p' | head -1)
+    VERIFY+=("IP выхода напрямую|INFO|${ip_direct:-недоступен}")
+    if [ -n "$ip_warp" ] && [ -n "$ip_direct" ] && [ "$ip_warp" != "$ip_direct" ]; then
+        VERIFY+=("IP через WARP != прямой IP|OK|warp: $ip_warp / direct: $ip_direct")
+    elif [ -z "$ip_warp" ]; then
+        VERIFY+=("IP через WARP != прямой IP|FAIL|IP через WARP не получен")
+        ok=0
+    else
+        VERIFY+=("IP через WARP != прямой IP|FAIL|совпадают ($ip_warp) — трафик идёт мимо WARP")
+        ok=0
+    fi
+
+    WARP_IP="${ip_warp:-недоступен}"
+    DIRECT_IP="${ip_direct:-недоступен}"
+    [ "$ok" -eq 1 ]
 }
 
-warp_connect() {
-    local st i
-    warp_svc_ensure
-    for i in $(seq 1 "$CONNECT_RETRIES"); do
-        log "warp: попытка подключения $i/$CONNECT_RETRIES ..."
-        $WARP_CLI connect >/dev/null 2>&1 || true
-        sleep "$CONNECT_WAIT"
-        st=$(warp_status)
-        if [ "$st" = "connected" ]; then
-            log "warp: подключён"
-            return 0
+print_verify() {
+    local row name res det
+    for row in "${VERIFY[@]:-}"; do
+        [ -n "$row" ] || continue
+        IFS='|' read -r name res det <<< "$row"
+        if [ -n "$det" ]; then
+            printf '  [%s] %-32s %s\n' "$res" "$name" "$det"
+        else
+            printf '  [%s] %-32s\n' "$res" "$name"
         fi
     done
-    log "warp: НЕ удалось подключиться (статус: $(warp_status))"
-    return 1
+}
+
+# ---------- перезапуск WARP ----------
+warp_restart() {
+    # $1 = номер круга
+    log "перезапуск WARP (круг $1/$HEAL_ROUNDS): disconnect + restart warp-svc + connect"
+    $WARP_CLI disconnect >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat warp-svc.service >/dev/null 2>&1; then
+        systemctl restart warp-svc 2>/dev/null || systemctl start warp-svc 2>/dev/null || true
+    fi
+    sleep 3
+    # на случай, если клиент оказался не в режиме прокси — вернуть WarpProxy
+    $WARP_CLI mode proxy >/dev/null 2>&1 || true
+    $WARP_CLI proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
+    $WARP_CLI connect >/dev/null 2>&1 || true
+    sleep "$HEAL_WAIT"
 }
 
 # ---------- egress-тесты ----------
 # $1 = url, $2 = "" (через WARP socks) или "direct" (напрямую)
-# печатает: "<код> <сек>"
 probe_site() {
     local url="$1" mode="${2:-}" args=()
     if [ "$mode" != "direct" ]; then
@@ -143,17 +213,7 @@ probe_site() {
          --max-time "$CURL_TIMEOUT" "${args[@]}" "$url" 2>/dev/null || echo "000 0"
 }
 
-egress_ip() {
-    # $1 = "" (через WARP) или "direct"
-    local mode="${1:-}" args=()
-    if [ "$mode" != "direct" ]; then
-        args+=(--socks5-hostname "$WARP_SOCKS")
-    fi
-    curl -s --max-time "$IP_TIMEOUT" "${args[@]}" \
-         https://api.ipify.org 2>/dev/null || echo "недоступен"
-}
-
-# строка в блок отчёта (без под-shell — счётчики EG_OK/EG_FAIL должны жить в текущем shell)
+# строка в блок отчёта (без под-shell — счётчики EG_OK/EG_FAIL живут в текущем shell)
 egress_line() {
     EGRESS_BLOCK="${EGRESS_BLOCK}$1
 "
@@ -184,24 +244,17 @@ run_egress_tests() {
     done
 }
 
-# ---------- Telegram ----------
-tg_send() {
-    local text="$1"
-    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || return 0
-    curl -s --max-time 15 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-         --data-urlencode "text=${text}" >/dev/null 2>&1 || true
-}
-
-# ---------- отчёт и алерты ----------
+# ---------- отчёт ----------
 write_report() {
     {
         echo "=== warp-monitor v$VERSION — $(_ts) ==="
         echo "host: $(hostname 2>/dev/null || echo '?')"
         echo "warp-cli: $(warp_cli_ok && echo 'найден' || echo 'НЕ УСТАНОВЛЕН')"
-        echo "warp статус: $WARP_ST"
         echo "IP выхода через WARP: $WARP_IP"
         echo "IP выхода напрямую:   $DIRECT_IP"
+        echo
+        echo "Верификация WARP:"
+        print_verify
         echo
         printf '%s\n' "$EGRESS_BLOCK"
         echo
@@ -209,106 +262,81 @@ write_report() {
     } > "$REPORT_FILE" 2>/dev/null || true
 }
 
-alert() {
-    # $1 = уровень (OK|WARN|CRIT), $2 = текст
-    local level="$1" text="$2" cur last
-    cur="$level"
-    last=""
-    [ -f "$STATE_FILE" ] && last=$(cat "$STATE_FILE" 2>/dev/null || true)
-    printf '%s\n' "$cur" > "$STATE_FILE" 2>/dev/null || true
-    if [ "$cur" = "OK" ] && [ "$last" = "OK" ]; then
-        return 0    # стабильно хорошо — не спамим
-    fi
-    if [ "$cur" = "OK" ] && [ "$ALERT_ON_RECOVER" != "1" ]; then
-        return 0
-    fi
-    if [ "$cur" = "OK" ] && [ -z "$last" ]; then
-        return 0    # первый успешный цикл — не шлём
-    fi
-    tg_send "warp-monitor [$(hostname 2>/dev/null || echo '?')] $level
-$text"
-}
-
 # ---------- команды ----------
 cmd_check() {
     prepare_dirs
     load_conf
-    local st i
-    st=$(warp_status)
-    case "$st" in
-        missing)
-            WARP_ST="warp-cli НЕ УСТАНОВЛЕН"
-            log "критично: warp-cli не установлен"
-            WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
-            EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
-            run_egress_tests direct
-            SUMMARY="CRIT: warp-cli не установлен"
-            write_report
-            out "$SUMMARY"
-            alert CRIT "warp-cli не установлен — мониторинг WARP невозможен"
-            return 2
-            ;;
-        unregistered)
-            WARP_ST="не зарегистрирован (Registration Missing)"
-            log "критично: WARP не зарегистрирован"
-            WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
-            EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
-            run_egress_tests direct
-            SUMMARY="CRIT: WARP не зарегистрирован (warp-cli registration new)"
-            write_report
-            out "$SUMMARY"
-            alert CRIT "WARP не зарегистрирован — нужен: warp-cli --accept-tos registration new"
-            return 2
-            ;;
-        disconnected|unknown)
-            log "warp: статус '$st' — пробую переподключить"
-            warp_connect || true
-            st=$(warp_status)
-            ;;
-    esac
 
-    if [ "$st" != "connected" ]; then
-        WARP_ST="ВЫКЛЮЧЕН (после $(echo "$CONNECT_RETRIES") попыток)"
-        log "критично: WARP не поднялся"
-        WARP_IP=$(egress_ip) DIRECT_IP=$(egress_ip direct)
+    if ! warp_cli_ok; then
+        WARP_IP="недоступен"; DIRECT_IP="недоступен"
+        VERIFY=("warp-cli установлен|FAIL|warp-cli не найден в PATH")
         EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
         run_egress_tests direct
-        SUMMARY="CRIT: WARP выключен, трафик идёт напрямую"
+        SUMMARY="CRIT: warp-cli не установлен — мониторинг невозможен"
         write_report
+        log "$SUMMARY"
         out "$SUMMARY"
-        alert CRIT "WARP выключен и не поднимается — трафик идёт напрямую (IP: $DIRECT_IP)"
         return 2
     fi
 
-    WARP_ST="Connected"
-    log "warp: Connected, запускаю egress-тесты"
-    WARP_IP=$(egress_ip)
-    DIRECT_IP=$(egress_ip direct)
+    local st i
+    st=$(warp_status)
+    if [ "$st" = "unregistered" ]; then
+        WARP_IP="недоступен"; DIRECT_IP="недоступен"
+        VERIFY=("warp-cli зарегистрирован|FAIL|Registration Missing — нужен: warp-cli --accept-tos registration new")
+        EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+        run_egress_tests direct
+        SUMMARY="CRIT: WARP не зарегистрирован — регистрацию нужно выполнить вручную"
+        write_report
+        log "$SUMMARY"
+        out "$SUMMARY"
+        return 2
+    fi
+
+    # --- верификация + перезапуск при сбое ---
+    if verify_warp; then
+        log "верификация WARP: все проверки OK — перезапуск не требуется"
+    else
+        log "верификация WARP: ЕСТЬ ПРОВАЛЫ — запускаю перезапуск"
+        print_verify | tee -a "$LOG_FILE" >&2
+        for i in $(seq 1 "$HEAL_ROUNDS"); do
+            warp_restart "$i"
+            if verify_warp; then
+                log "перезапуск помог: WARP работает (круг $i/$HEAL_ROUNDS)"
+                break
+            fi
+            log "круг $i/$HEAL_ROUNDS: WARP всё ещё не работает"
+        done
+    fi
+
+    # --- egress-тесты ---
     EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
+    if printf '%s\n' "${VERIFY[@]:-}" | grep -q '|FAIL|'; then
+        SUMMARY="CRIT: WARP НЕ работает после $HEAL_ROUNDS перезапусков (детали в отчёте)"
+        run_egress_tests direct
+        write_report
+        log "$SUMMARY"
+        out "$SUMMARY"
+        return 2
+    fi
+
     run_egress_tests
     if [ "$RUN_DIRECT_TEST" = "1" ]; then
         run_egress_tests direct
     fi
 
-    if [ "$EG_FAIL" -ge "$FAIL_THRESHOLD" ]; then
-        SUMMARY="WARN: через WARP доступно $EG_OK из $((EG_OK+EG_FAIL)) сайтов"
+    if [ "$EG_FAIL" -gt 0 ]; then
+        SUMMARY="WARN: WARP работает (warp=on), но $EG_FAIL из $((EG_OK+EG_FAIL)) сайтов не ответили через туннель"
         write_report
+        log "$SUMMARY"
         out "$SUMMARY"
-        alert WARN "$SUMMARY
-IP выхода через WARP: $WARP_IP"
-        return 1
-    elif [ "$EG_FAIL" -gt 0 ]; then
-        SUMMARY="WARN: $EG_FAIL сайтов(а) не ответили через WARP (доступно $EG_OK)"
-        write_report
-        out "$SUMMARY"
-        alert WARN "$SUMMARY"
         return 1
     fi
 
-    SUMMARY="OK: WARP Connected, все $EG_OK сайтов доступны через WARP (IP выхода: $WARP_IP)"
+    SUMMARY="OK: WARP работает (warp=on, IP выхода: $WARP_IP), все $EG_OK сайтов доступны через туннель"
     write_report
+    log "$SUMMARY"
     out "$SUMMARY"
-    alert OK "$SUMMARY"
     return 0
 }
 
@@ -318,7 +346,7 @@ cmd_egress() {
     EG_OK=0; EG_FAIL=0; EGRESS_BLOCK=""
     run_egress_tests
     printf '%s' "$EGRESS_BLOCK"
-    out "IP выхода через WARP: $(egress_ip)"
+    out "IP выхода через WARP: $(curl -s --max-time "$IP_TIMEOUT" --socks5-hostname "$WARP_SOCKS" https://api.ipify.org 2>/dev/null || echo недоступен)"
 }
 
 cmd_status() {
@@ -329,7 +357,7 @@ cmd_status() {
     if [ -f "$REPORT_FILE" ]; then
         echo
         echo "--- последний отчёт ($REPORT_FILE) ---"
-        tail -n 20 "$REPORT_FILE"
+        tail -n 30 "$REPORT_FILE"
     else
         echo "отчёта ещё нет — выполните: warp-monitor.sh check"
     fi
@@ -342,10 +370,9 @@ cmd_report() {
 
 cmd_setup_proxy() {
     load_conf
-    local port="${WARP_SOCKS##*:}"
-    log "включаю режим WarpProxy на порту $port"
+    log "включаю режим WarpProxy на порту $WARP_PROXY_PORT"
     $WARP_CLI mode proxy >/dev/null 2>&1 || true
-    $WARP_CLI proxy port "$port" >/dev/null 2>&1 || true
+    $WARP_CLI proxy port "$WARP_PROXY_PORT" >/dev/null 2>&1 || true
     $WARP_CLI connect >/dev/null 2>&1 || true
     sleep 2
     echo "статус: $(warp_status); socks: $WARP_SOCKS"
@@ -363,7 +390,7 @@ cmd_install() {
         die "нет каталога /etc/cron.d — добавьте в crontab вручную: 17 * * * * $self check --quiet"
     fi
     cat > "$cron_f" <<EOF
-# warp-monitor — почасовая проверка WARP + egress-тесты
+# warp-monitor — почасовая проверка WARP (100% верификация) + egress-тесты
 # ставится скриптом warp-monitor.sh install; удалить: warp-monitor.sh uninstall
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -389,7 +416,6 @@ EOF
 
     out "Готово. Проверка выполняется каждый час (в HH:17)."
     out "Запустить сейчас:  $self check"
-    out "Тест Telegram:     $self test-alert"
 }
 
 cmd_uninstall() {
@@ -398,18 +424,8 @@ cmd_uninstall() {
     out "Удалено."
 }
 
-cmd_test_alert() {
-    load_conf
-    if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-        die "Telegram не настроен: заполните TELEGRAM_TOKEN и TELEGRAM_CHAT_ID в $CONF"
-    fi
-    tg_send "warp-monitor [$(hostname 2>/dev/null || echo '?')] OK
-Тестовое уведомление — алерты работают."
-    out "Тестовое сообщение отправлено."
-}
-
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ---------- main ----------
@@ -417,7 +433,7 @@ main() {
     local cmd="check" a
     for a in "$@"; do
         case "$a" in
-            --quiet)  QUIET=1 ;;
+            --quiet)   QUIET=1 ;;
             --version) echo "warp-monitor $VERSION"; exit 0 ;;
             -h|--help|help) usage; exit 0 ;;
             *) cmd="$a" ;;
@@ -431,7 +447,6 @@ main() {
         setup-proxy)  cmd_setup_proxy ;;
         install)      cmd_install ;;
         uninstall)    cmd_uninstall ;;
-        test-alert)   cmd_test_alert ;;
         *)            usage; exit 2 ;;
     esac
 }
